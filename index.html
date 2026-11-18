@@ -417,6 +417,14 @@ tbody td{white-space:nowrap}
 .promo-badge.yes{background:var(--up-soft);color:var(--up);box-shadow:inset 0 0 0 1px rgba(224,49,49,.18)}
 .promo-badge.no{background:var(--panel-3);color:var(--muted)}
 .promo-badge.na{background:var(--warn-soft);color:var(--warn)}
+#liveToast{
+  position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(8px);
+  z-index:9999;padding:9px 16px;border-radius:10px;
+  background:var(--panel-2);border:1px solid var(--line-strong);
+  box-shadow:0 8px 24px rgba(0,0,0,.14);font-size:12px;color:var(--text);
+  opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;max-width:min(92vw,560px);
+}
+#liveToast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .promo-badge.open{background:var(--warn-soft);color:var(--warn);box-shadow:inset 0 0 0 1px rgba(199,125,10,.22)}
 .promo-sub{font-size:9.5px;color:var(--muted);white-space:nowrap;letter-spacing:-.01em}
 /* 实时涨跌幅列 */
@@ -1243,8 +1251,75 @@ function openOf(s, now){
      · 判定时点现价仍≥涨停价（封板）        → 晋级
      · 曾触及涨停价、但判定时点已开板（炸板） → 开板，不计晋级
      · 区间内最高价未触及涨停价              → 未晋级 */
-const SNAPSHOT_AT = new Date("2026-11-18T13:44:00+08:00");      // 行情快照时点（盘中）
+let   SNAPSHOT_AT = new Date("2026-11-18T13:44:00+08:00");      // 行情快照时点（盘中，实时刷新后更新）
 const effAt = d => (d.getTime() > SNAPSHOT_AT.getTime() ? SNAPSHOT_AT : d);
+
+/* ---------- 实时行情刷新：腾讯 qt.gtimg.cn 批量快照（script 标签跨域，无需凭据） ----------
+   字段序号：3现价 4昨收 5今开 6成交量(手) 30时间戳 31涨跌 32涨跌幅% 33最高 34最低 47涨停价 48跌停价 */
+function qtPrefix(code){ return code.startsWith("6") ? "sh" : (code.startsWith("4")||code.startsWith("8")) ? "bj" : "sz"; }
+
+function refreshLiveQuotes(onDone){
+  const list = ((state.data && state.data.watch) || []).filter(s => s.code && /^[036]/.test(s.code));
+  if(!list.length){ onDone({ ok:false, reason:"无可刷新标的" }); return; }
+  const cbName = "_qtLive_" + Date.now();
+  const sc = document.createElement("script");
+  let settled = false;
+  const finish = res => { if(settled) return; settled = true; sc.remove();
+    try{ delete window[cbName]; }catch(e){ window[cbName] = undefined; } onDone(res); };
+  window[cbName] = res => finish(res);
+  sc.onload = () => {
+    try{
+      let got = 0, miss = 0, maxTs = 0;
+      list.forEach(s => {
+        const raw = window["v_" + qtPrefix(s.code) + s.code];
+        if(!raw){ miss++; return; }
+        const f = raw.split("~");
+        const price = parseFloat(f[3]), pc = parseFloat(f[4]), op = parseFloat(f[5]);
+        const hi = parseFloat(f[33]), lo = parseFloat(f[34]), pct = parseFloat(f[32]);
+        const lim = parseFloat(f[47]), vol = parseFloat(f[6]), ts = f[30];
+        if(!(price > 0) || !/^\d{14}$/.test(ts||"")){ miss++; return; }
+        const d  = ts.slice(0,4)+"-"+ts.slice(4,6)+"-"+ts.slice(6,8);
+        const bars = (s.after = s.after || []);
+        const last = bars[bars.length-1];
+        if(last && last.d === d){
+          if(op > 0 && last.o == null) last.o = op;
+          if(pc > 0) last.pc = pc;
+          if(lim > 0) last.lim = lim;
+          last.h = Math.max(last.h || price, hi > 0 ? hi : price);
+          last.l = last.l ? Math.min(last.l, lo > 0 ? lo : price) : (lo > 0 ? lo : price);
+          last.c = price; last.p = pct;
+          if(vol > 0) last.v = vol;
+        } else if(!last || d > last.d){
+          bars.push({ d, o: op > 0 ? op : price, h: hi > 0 ? hi : price, l: lo > 0 ? lo : price,
+            c: price, pc: pc > 0 ? pc : undefined, lim: lim > 0 ? lim : undefined, p: pct, v: vol > 0 ? vol : undefined });
+        } else { miss++; return; }
+        const tn = parseInt(ts.slice(0,12),10);
+        if(tn > maxTs) maxTs = tn;
+        got++;
+      });
+      if(maxTs){
+        const t = String(maxTs);
+        SNAPSHOT_AT = new Date(`${t.slice(0,4)}-${t.slice(4,6)}-${t.slice(6,8)}T${t.slice(8,10)}:${t.slice(10,12)}:00+08:00`);
+        PROMO_SNAPSHOT.asOf = `${t.slice(0,4)}-${t.slice(4,6)}-${t.slice(6,8)} ${t.slice(8,10)}:${t.slice(10,12)}`;
+        PROMO_SNAPSHOT.src  = "腾讯行情 qt.gtimg.cn（实时快照）";
+      }
+      finish({ ok: got > 0, updated: got, miss, at: maxTs ? PROMO_SNAPSHOT.asOf : null });
+    }catch(e){ finish({ ok:false, reason:e.message }); }
+  };
+  sc.onerror = () => finish({ ok:false, reason:"行情接口加载失败" });
+  sc.src = "https://qt.gtimg.cn/q=" + list.map(s => qtPrefix(s.code) + s.code).join(",") + "&_=" + Date.now();
+  document.head.appendChild(sc);
+  setTimeout(() => finish({ ok:false, reason:"行情接口超时" }), 8000);
+}
+
+function toast(msg, ms){
+  let t = document.getElementById("liveToast");
+  if(!t){ t = document.createElement("div"); t.id = "liveToast"; document.body.appendChild(t); }
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), ms || 3800);
+}
 
 function promoOf(s, now){
   const at  = now || state.queryAt || new Date();
@@ -1408,7 +1483,7 @@ function renderWatch(){
     `<b>是否晋级</b>：起点＝入选日 ${state.data.date} 收盘，<b>判定时点＝${ckNow.label}</b>（本次查询时刻与最新行情快照取较早者）；<b>以判定时点的状态为准</b>——此时现价仍≥涨停价（封板）才标「晋级」；若此前曾触及涨停价、但判定时点已开板（炸板），标「开板」，<b>不计晋级</b>。本期：晋级 <b style="color:var(--up)">${promoHit}</b> · 开板 <b style="color:var(--warn)">${promoOpen}</b> · 未晋级 <b>${pool.length - promoHit - promoOpen}</b>。<br>` +
     `<b>开盘情况</b>：取选股日次一交易日的开盘价与选股日收盘价比较——高于＝<b style="color:var(--up)">红开</b>、低于＝<b style="color:var(--down)">绿开</b>、相等＝平开；次日非交易日自动顺延至下一个交易日；行情未生成则显示「待更新」。本期：` +
     `红开 <b style="color:var(--up)">${oUp}</b> · 绿开 <b style="color:var(--down)">${oDown}</b> · 平开 <b>${oFlat}</b> · 待更新 <b>${oWait}</b>。` +
-    `<span style="color:var(--muted)">行情快照 ${PROMO_SNAPSHOT.asOf}（盘中）· ${PROMO_SNAPSHOT.src}；收盘后点「刷新数据」按最新接入数据重算。</span>`;
+    `<span style="color:var(--muted)">行情快照 ${PROMO_SNAPSHOT.asOf} · ${PROMO_SNAPSHOT.src}；点「刷新数据」接入腾讯实时行情重算（大盘/情绪/梯形图为 ${state.data.date} 收盘口径，不随盘中刷新）。</span>`;
 
   const thr = (VOL_MIN / VOL_BAR_MAX * 100).toFixed(1) + "%";
 
@@ -1633,7 +1708,20 @@ function run(requested, now){
 }
 
 /* ---------- 9. interactions ---------- */
-$("#refreshBtn").addEventListener("click", ()=>run($("#tradeDate").value, new Date()));
+$("#refreshBtn").addEventListener("click", () => {
+  const btn = $("#refreshBtn");
+  btn.disabled = true; btn.textContent = "刷新中…";
+  refreshLiveQuotes(res => {
+    btn.disabled = false; btn.textContent = "刷新数据";
+    if(res.ok){
+      toast(`已接入实时行情 ${res.updated} 只 · 快照 ${res.at}` +
+        (res.miss ? `（${res.miss} 只未返回，保留原值）` : "") + "，表格已重算");
+    }else{
+      toast(`实时行情获取失败（${res.reason}），仍显示内置快照 ${PROMO_SNAPSHOT.asOf}`);
+    }
+    run($("#tradeDate").value, new Date());
+  });
+});
 
 $("#tradeDate").addEventListener("change", e=>{
   state.requested = e.target.value;
